@@ -8,111 +8,154 @@ from torch.optim import lr_scheduler
 import torch
 import warnings
 import matplotlib.pyplot as plt
+import numpy as np
 
 warnings.filterwarnings("ignore")
 
-
-if __name__ == '__main__':
-
+# python train.py --epochs 10 --num_classes 2
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epoch", type=int, default=10)
-    parser.add_argument("--num_classes", type=int)
-    parser.add_argument("--save_path", type=str, default='./model.pth')
+    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--num_classes", type=int, required=True, help="Number of output classes")
+    parser.add_argument("--save_path", type=str, default='./model.pth', help="Path to save the best model")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 
     args = parser.parse_args()
 
-    # python train.py --epoch 15 --num_classes 2 --save_path ./model.pth
-
-    epochs = args.epoch
+    epochs = args.epochs
     num_classes = args.num_classes
-    save_path = Path(args.save_path)
+    save_path = args.save_path
 
-    # 加载模型
-    model = Net(num_classes=2)
-    model = model.cuda()
+    # 设备配置
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    train_loss_list = []
-    train_acc_list = []
-    test_acc_list = []
+    # 初始化模型
+    model = Net(num_classes=num_classes)
+    model = model.to(device)
 
+    # 混合精度训练
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
-    # 定义损失函数和优化器
-    loss_function = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    lr = 1e-3
 
-    lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    # 优化器与学习率调度
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3, verbose=True
+    )
 
-    max_accuracy = 0
+    # 损失函数
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 添加标签平滑
 
+    # 训练记录
+    records = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_acc": []
+    }
+
+    best_acc = 0.0
+
+    # 训练循环
     for epoch in range(epochs):
-        # 训练模型
         model.train()
-
         running_loss = 0.0
         correct = 0
         total = 0
+
+        print(f"\nEpoch {epoch + 1}/{epochs}")
+        print("-" * 30)
+
         for images, labels in train_loader:
-            images = images.cuda()
-            labels = labels.cuda()
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(images)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            # 混合精度前向传播
+            with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
+            # 反向传播
+            scaler.scale(loss).backward()
+
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            # 统计指标
             running_loss += loss.item()
-
-            _, predicted = torch.max(outputs.data, 1)
+            _, predicted = outputs.max(1)
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            correct += predicted.eq(labels).sum().item()
 
-        train_accuracy = correct / total
+        # 计算训练指标
         train_loss = running_loss / len(train_loader)
-        train_loss_list.append(train_loss)
-        train_acc_list.append(train_accuracy)
+        train_acc = correct / total
 
-        # 测试模型
+        # 验证过程
         model.eval()
-
         correct = 0
         total = 0
+
         with torch.no_grad():
             for images, labels in test_loader:
-                images = images.cuda()
-                labels = labels.cuda()
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 outputs = model(images)
-                _, predicted = torch.max(outputs.data, 1)
+                _, predicted = outputs.max(1)
 
                 total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                correct += predicted.eq(labels).sum().item()
 
-        test_accuracy = correct / total
-        test_acc_list.append(test_accuracy)
+        val_acc = correct / total
 
-        if test_accuracy > max_accuracy:
-            max_accuracy = test_accuracy
+        # 学习率调整
+        scheduler.step(val_acc)
+
+        # 记录历史
+        records["train_loss"].append(train_loss)
+        records["train_acc"].append(train_acc)
+        records["val_acc"].append(val_acc)
+
+        # 保存最佳模型
+        if val_acc > best_acc:
+            best_acc = val_acc
             torch.save(model.state_dict(), save_path)
 
-        print("Epoch {}: --Training loss: {:.4f} --Training accuracy: {:.4f} --Test accuracy: {:.4f}".format(epoch+1,
-                                                                                                    train_loss, train_accuracy, test_accuracy))
+        # 打印统计信息
+        print(f"--Train Loss: {train_loss:.4f}  --Train Acc: {train_acc:.4f}  --Val Acc: {val_acc:.4f}")
 
-        # 更新学习率
-        lr_scheduler.step()
+    # 可视化训练过程
+    visualize_training(records, epochs)
 
-    # 保存训练好的模型
-    torch.save(model.state_dict(), save_path)
+def visualize_training(records, epochs):
+    plt.figure(figsize=(12, 9))
 
-    # 训练结果可视化
-    x = ['{}'.format(i + 1) for i in range(epochs)]
-    plt.figure(figsize=(10, 8), dpi=80)
-    plt.xlabel("训练轮数")
-    plt.xlabel("Epoch")
-    plt.plot(x, train_loss_list, color='blue')
-    plt.plot(x, train_acc_list, color='yellow')
-    plt.plot(x, test_acc_list, color='red')
-    plt.legend(["Train Loss", "Train Accuracy", "Test Accuracy"])
-    plt.grid(alpha=0.5)
+    # 损失曲线
+    plt.subplot(2, 2, 1)
+    plt.plot(np.arange(epochs), records["train_loss"], "b-", label="Training Loss")
+    plt.title("Training Loss")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.grid(True, alpha=0.3)
+
+    # 准确率曲线
+    plt.subplot(2, 2, 2)
+    plt.plot(np.arange(epochs), records["train_acc"], "g-", label="Training Accuracy")
+    plt.plot(np.arange(epochs), records["val_acc"], "r-", label="Validation Accuracy")
+    plt.title("Accuracy")
+    plt.xlabel("Epochs")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
     plt.show()
+
+if __name__ == "__main__":
+    main()
